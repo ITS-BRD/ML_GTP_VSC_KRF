@@ -1,20 +1,14 @@
 ;******************** (C) COPYRIGHT HAW-Hamburg ********************************
 ;* File Name          : main.s
-;* Author             : Silke Behn	
-;* Version            : V1.0
-;* Date               : 01.06.2021
-;* Description        : This is the solution with FSM
-;					  :
+;* Author             : Franz Korf	
+;* Version            : V1.1
+;* Date               : 24.03.2026
+;* Description        : Simple Soluation 
 ;					  : Replace this main with yours.
 ;
 ;*******************************************************************************
 
-; Offene Punkte
-; - Textausgabe vereinfachen
-
-
 ; Define address of selected GPIO and Timer registers
-
 PERIPH_BASE     	equ	0x40000000                 ;Peripheral base address
 APB2PERIPH_BASE 	equ	(PERIPH_BASE + 0x00010000)
 AHB1PERIPH_BASE 	equ	(PERIPH_BASE + 0x00020000)
@@ -34,12 +28,6 @@ TIMER				equ (TIM2_BASE + 0x24)   ; CNT : current time stamp (32 bit),  resoluti
 TIM2_PSC			equ (TIM2_BASE + 0x28)   ; Prescaler  resolution
 TIM2_ERG			equ (TIM2_BASE + 0x14)   ;16 Bit register, Bit 0 : 1 Restart Timer
 
-
-; Allgemeine Konstante
-;********************************************
-TRUE				EQU			0x01
-FALSE				EQU			0x00
-
 ; States der FSM
 ;--------------------------------------------
 INIT_STATE			EQU			0x01
@@ -56,312 +44,281 @@ LED_HOLD			EQU			(0x01 << 1)
 TAS7				EQU			(0x01<<7)
 TAS6				EQU			(0x01<<6)
 TAS5				EQU			(0x01<<5)
-TASTER_MASK			EQU			(TAS7 + (TAS6 + TAS5))	
 
-; Linke obere Ecke der TFT Ausgabe
+; Konstanten zum Ansteuern des Displays
 ;--------------------------------------------
-G_X_POS				EQU			2						; Spalte (X) Position
-G_Y_POS				EQU		 	2						; Zeile  (Y) Position
-
+G_X_POS				EQU			2						; X Position Begrüßungstext
+G_Y_POS				EQU		 	2						; Y Position Begrüßungstext
+TFT_TIME_X_POS      EQU         (G_X_POS + 7)  			; X Position Zeitausgabe
+TFT_TIME_Y_POS      EQU         (G_Y_POS + 4)           ; Y Position Zeitausgabe
+DEFAULT_BRIGHTNESS	EQU         800
 
     EXTERN initITSboard
     EXTERN GUI_init
-	EXTERN TP_Init
 	EXTERN initTimer
 	EXTERN lcdSetFont
 	EXTERN lcdGotoXY      		; TFT goto x y function
-	EXTERN lcdPrintS			; TFT output function	  
-	EXTERN Delay				; Delay (ms) function
+	EXTERN lcdPrintS			; TFT output function
+	EXTERN lcdPrintC	        ; TFT output function
 
-
-;********************************************
-; Data section, aligned on 4-byte boundery
-;********************************************
+;****************************************************************************
+;   Start DATA Segment
 	AREA MyData, DATA, align = 2
 
-; Die gestoppte Zeit wird an drei Stellen dargestellt:
-; (1) Die gestoppten Zeitspannen, die sich durch den Zugriff auf TIMER
-;     ergibt. Sie wird in der Genauigkeit des Timers (1 Tick = 10 us) 
-;     gespeichert. 
-;     Die aktuelle  Zeitspanne und die Zeitspanne, die TFTZeit entspricht,
-;	  werden in Registern in der main Funktion gespeichert.
-; (2) Der Str. der Zeit, die auf dem Display ausgegeben werden soll.
-;     Der Str. steht im Speicher an der Adresse TFTZeit.
-; (3) Die Darstellung von TFTZeit auf dem TFT Display. Die ‹bertragung der Zeit
-;     dauert relativ lange. Daher wir der von rechts gesehene groesste
-;     Teilstr. von TFTZeit ¸bertragen, der sich geaendert hat.	
+;****************************************************************************
+; Berechnung der vergangenen Zeit
+; 
+; Der Timer aktualisiert mit der Frequenz 10^-5 Hz das CNT Register des Timers.
+; Durch lesen der Adresse TIMER erhält man den aktuellen Wert dieses Registers.
+; Einen Wert dieses Registers nennt man Zeitstempel. 
+;
+; Die Funktion UpdateUhr speichert den aktuellen Zeitstempel und berechnet die 
+; Zeitspanne, die zwischen zwei Aufrufen der Funktion vergangen ist. Dies 
+; wird durch Subtraktion des Zeitstempels, der beim letzten Aufruf der Funktion 
+; gespeichert wurde, vom aktuellen Zeitstempel berechnet.
+; Zur Initialisierung wird UpdateUhr einmalig aufgerufen.
+;
+; Am Anfang der SuperLoop wird UpdateUhr aufgerufen. So erhält man die 
+; Zeitspanne, die seit dem letzten Aufruf der SuperLoop vergangen ist. 
 
-; Zu jeder Stelle von TFTZeit -also der Ausgabe - werden folgende Informationen
-; gespeichert:
-; (1) Die Position im TFTZeit Str., an der dieser Stelle steht. Dies wird den 
-;     die Ausgabe eines geaenderten Teilstr. von TFTZeit benoetigt.
-; (2) Die 10-Sekunden Stelle und die 10-Minuten Stelle werden zur Baais 6 
-;     dargestellt. Die anderen Stellen werden zur Basis 10 dargestellt.
-;     Die Basis einer Stelle wird gespeichert.
+TimeStamp           DCD     0    ; Zeitstempel von UpdateUhr
 
-	ALIGN		  		; StrPos  Basis
-Pos100telSec		DCB		7,		10
-Pos10telSec			DCB		6,		10
-Pos1sec				DCB		4,		10
-Pos10Sec			DCB		3,		6
-Pos1Min				DCB		1,		10
-Pos10Min			DCB		0,		6
+;****************************************************************************
+; Aktualisierung der Display-Ausgabe
+;
+; Die Zeitspanne, die seit dem Start der Uhr vergangen ist, wird in einem
+; Register mit der Genauigkeit des Timers (1 Tick = 10 us) gespeichert. 
+;
+; Die Zeit auf dem Display wird mit der Genauigkeit von 1/100 s im folgenden 
+; Format ausgegeben:
+;                       mm:ss.nn
+;
+; Die auf dem Display dargestellte Zeit steht im Feld ValOnDisplay. Jede Stelle 
+; wird separat gespeichert.
+;                       Display String 23:15.46
+;                       Stelle 0 ------|| || ||---- Stelle 5
+;                       Stelle 1 -------| || |----- Stelle 4
+;                       Stelle 2 ---------||------- Stelle 3
+; 
+; Pro Stelle speichert das Feld StrOffset den Offset im String auf dem Display.
+;
+; Der Registerwert der aktuellen Zeit wird wie folgt in ValOnDisplay gespeichert:
+; Pro Stelle speichert das Feld ModVal den Wert 
+;             1 + Maximale Zeitspanne in 1/100 s, die bis zu dieser Stelle anzeigbar ist. 
+; z.B. Stelle 1 
+;      maximale Zeit 9:59.99
+;      ModVal[1] = 1 + 9 * 60 * 100 + 59 * 100 + 99 = 60000
+; z.B. Stelle 0 
+;      maximale Zeit 59:59.99
+;      ModVal[1] = 1 + 59 * 60 * 100 + 59 * 100 + 99 + 1 1/100s = 360000
+;
+; Die Wert von Stelle i ist dann : ((Register mit akt. Zeitspanne) % ModVal[i]) / ModVal[i + 1]
+
+;                          Stelle 0, Stelle 1, Stelle 2, Stelle 3, Stelle 4, Stelle 5, Stelle 6
+StrOffset 			DCB       0    ,    1    ,    3    ,    4    ,    6    ,    7
+ValOnDisplay 	    DCB       0    ,    0    ,    0    ,    0    ,    0    ,    0  
+ModVal	            DCD    360000  ,  60000  ,  6000   ,  1000   ,   100   ,    10   ,    1
 	
 TFTtext				DCB		"HAW Stoppuhr",0	; Begruessungstext TFT
 TFTZeit				DCB		"00:00.00",0		; Uhrzeit, die auf dem TFT Display ausgegegen werden soll
 
-	ALIGN
-TimeStamp		   	DCD	    0x00				; Halbwort, dass den letzten Zeitstempel speichert.
-DEFAULT_BRIGHTNESS	DCW     800
-
-;********************************************
-; Code section, aligned on 8-byte boundery
-;********************************************
+;****************************************************************************
+;   Start Text Segment
 	AREA |.text|, CODE, READONLY, ALIGN = 3
+	EXPORT main [CODE]
 
-;--------------------------------------------
-; Ansteuerung der LEDs
-;--------------------------------------------
+;****************************************************************************
+; Ansteuerung der GPIOs - LEDs und Taster
 
-; Schalte mehrere LEDs an
-;--------------------------------------------
-LEDson	PROC	; verwende nur R0 bis R3 und keine weiteren PROC Aufrufe, sichern der Register entfaellt
-		;	IN	R0		LEDs die angeschaltet werden sollen
+LEDson PROC	
+        ; Schalte mehrere LEDs an
+		; IN	R0	    LEDs die angeschaltet werden sollen
+		; Hinweis: Da nur R0 bis R3 verwendet werden, müssen Register nicht gesichert werden
 		LDR		R1,=GPIO_D_SET
 		STRH	R0,[R1]
 		BX		LR
 		ENDP
 
-; Schalte mehrere LEDs aus
-;--------------------------------------------
-LEDsoff	PROC	; verwende nur R0 bis R3 und keine weiteren PROC Aufrufe, sichern der Register entfaellt
-		;	IN	R0		LEDs die ausgeschaltet werden soll
+LEDsoff PROC	
+        ; Schalte mehrere LEDs aus
+		; IN	R0	    LEDs die ausgeschaltet werden sollen
+		; Hinweis: Da nur R0 bis R3 verwendet werden, müssen Register nicht gesichert werden
 		LDR		R1,=GPIO_D_CLR
 		STRH	R0,[R1]
 		BX		LR
 		ENDP
 
-; Update LEDs
-;--------------------------------------------
-UpdateLEDs	PROC						
-		;	IN	R0		Aktuelle Zustand der FSM
-		PUSH		{R4,LR}					; Sicher Register
-		MOV			R1,#0x0					; R1 speichert die LEDs, die gesetzt werden sollen
-		MOV			R4,#0x0					; R4 speichert die LEDs, die geloescht werden sollen
-		CMP			R0,#INIT_STATE			; Update LED RUNNING
-		ADDNE		R1,#LED_RUNNING
-		ADDEQ		R4,#LED_RUNNING
-		CMP			R0,#HOLD_STATE			; Update LED HOLD
-		ADDEQ		R1,#LED_HOLD		
-		ADDNE		R4,#LED_HOLD
-		MOV			R0,R1					; Schalte LEDs
-		BL			LEDson
-		MOV 		R0,R4
-		BL			LEDsoff
-		POP			{R4,PC}					; Restore Register und Ruecksprung
+LeseTaster PROC
+        ; Ermittelt ob genau ein Taster gedrückt ist
+		; OUT	R0 == TAS5      wenn nur Taster 5 gedrückt ist
+		;    	R0 == TAS6      wenn nur Taster 6 gedrückt ist
+		;   	R0 == TAS7      wenn nur Taster 7 gedrückt ist
+		;   	R0 == 0         wenn kein oder mehrere Taster gedrückt sind
+		; Hinweis: Da nur R0 bis R3 verwendet werden, müssen Register nicht gesichert werden
+		LDR		R0, =GPIO_F_PIN				; Lese Tasterstatus ein
+		LDRB	R0, [R0]
+		EOR     R0, #0xFF
+		AND		R0, R0,#(TAS5 + TAS6 + TAS7)		
+		; aktuelle Wert von R0 : Bit 1 gesetzt: Taster i gedrückt
+        ; Wenn genau 1 Taster gedrückt ist, dann ist R0 einen 2-er Potenz.
+		; So wird nun getestet, ob genau ein Taster gedrückt ist.
+        SUB     R1, R0, #1       
+        AND     R1, R0, R1      ; R1 = R0 & (R0 - 1)
+        CMP     R1, #0          
+		; Wenn R1 == 0, dann ist R0 eine Zweierpotenz und somit genau ein oder kein Taster gedrückt
+		MOVNE   R0, #0          ; lösche R0, wenn mehrere Taster gedrückt sind
+		BX		LR
 		ENDP
 
-;--------------------------------------------
-; Ansteuerung des TFT Display
-;--------------------------------------------
+;****************************************************************************
+; Berechnung der Zeitspanne
 
-; PrintTFTZeit gibt TFTZeit auf den TFT Display aus.
-; Es wird nur der Teilstring aktualisiert, der sich geaendert hat. 
-; Der Teilstr. beginnt an der weitesten links stehenden Position
-; im TFTZeit, die sich ge‰ndert hat.
-;--------------------------------------------
-PrintTFTZeit	PROC
-		;	IN	R0		Position im TFTUhr Str, ab der ausgegeben werden soll
-		PUSH		{R4,LR}					; Sicher Register
-		MOV			R4,R0					; R4 = Position im TFTZeit Str, aber der die Ausgabe erfolgt		
-		ADD			R0, R4, #G_X_POS + 2	; Positioniere Cursor, X Position
-		MOV			R1,	#G_Y_POS + 3
-		BL			lcdGotoXY
-		LDR			R0, =TFTZeit
-		ADD 		R0,R4					; Selektiere Teilstr. im TFTUhr
-		BL			lcdPrintS
-		POP			{R4,PC}					; Restore Register und Ruecksprung
+UpdateUhr PROC
+		; OUT	R0	    Vergangene Zeitspanne seit dem letzten Aufruf von UpdateUhr
+		; Hinweis: Da nur R0 bis R3 verwendet werden, müssen Register nicht gesichert werden
+		LDR		R0, =TIMER					; R0 = neuer Zeitstempel
+		LDR 	R0, [R0]
+		LDR		R2, =TimeStamp				; R2 = Adresse alter Zeitstempel
+		LDR		R1, [R2]					; R1 = alter Zeitstempel
+		STR		R0, [R2]					; Update TimeStamp
+		SUB		R0, R1						; R1 = neuer Zeitstempel - alter Zeitstempel
+		BX		LR
 		ENDP
 
-; Initialisierung des TFT Displays
-;--------------------------------------------
-InitTFT	PROC    
+;****************************************************************************
+; Ausgabe der Zeit auf dem Display
+ 
+InitTFT	PROC
+		; Initialisierueng des Displays
 		PUSH		{R4,LR}					; Sicher Register
 		MOV			R0, #G_X_POS			; Positioniere Cursor
 		MOV			R1,	#G_Y_POS			
 		BL			lcdGotoXY
-		LDR 		R0,=TFTtext				; Gebe Begruessung auf dem TFT aus
+		LDR 		R0, =TFTtext			; Gebe Begruessung auf dem TFT aus
 		BL			lcdPrintS
-		MOV			R0,#0					; Gebe TFTZeit auf dem TFT aus
-		BL			PrintTFTZeit			 
-		POP			{R4,PC}
+		MOV			R0, #TFT_TIME_X_POS		; Positioniere Cursor
+		MOV			R1,	#TFT_TIME_Y_POS			
+		BL			lcdGotoXY
+		LDR			R0, =TFTZeit			; Gebe TFTZeit auf dem TFT aus
+		BL			lcdPrintS			 
+		POP			{R4,PC}					; Restore Register und Ruecksprung
 		ENDP
 
-;--------------------------------------------
-; Behandlung der TFTUhr Variablen
-;--------------------------------------------
-
-; Diese Funktion aktualisiert die Variable TFTZeit und gibt den Teilstr. dieser
-; Variablen aus, der sich ge‰ndert hat. TFTZeit wird nur aktualisiert, wenn eine 
-; Aenderung vorliegt. Auf dem TFT Display wird nur der geaenderte Teilstr. aktualisiert.
-; Dies wird auf Basis der Zeitspannen realisiert. Daher wird die aktuelle Zeitspanne
-; und die Zeitspanne, aus der TFTZeit abgeleitet wurde, als Parameter uebergeben.
-;--------------------------------------------
-UpdateAndPrintTFTZeit	PROC
-		;	IN	R0		Aktuelle Zeitspanne
-		;	IN 	R1		Zeitspanne, die TFTUhr entspricht		
-		PUSH		{R4,R5,R6,R7,R8,LR}		; Sicher Register
-		MOV			R4,#1000				; Runde beide Zeitspanne auf 1/100 sec
-		UDIV		R0,R0,R4				; R0 = Aktuelle Zeitspanne auf aktuelle Stelle gerundet
-		UDIV		R1,R1,R4				; R1 =  Zeitspanne der TFTUhr auf aktuelle Stelle gerundet
-		CMP			R0,R1
-		BEQ			endUpdateAndPrintTFTZeit; Aktuelle Zeitspanne wird schon auf der TFT Uhr anzeigt
-		MOV			R2,#0					; R2 : Laufindex
-		LDR			R3,=Pos100telSec		; R3 : Basis Adresse fuer aktuelle Stelle
-		MOV			R8,#0					; R8 : linke Position, ab der Ausgabestr. veraendert wurde
-		LDR			R7,=TFTZeit				; R7 : Basis Adresse des TFTZeit Strs
-forUpdateLoop
-		CMP			R2,#6					; for 0 <= R2 < 6
-		BEQ			forUpdateEnd
-		; Berechne Module der Stellen
-		LDRB		R4,[R3,#1]				; R4 : Modulo der aktuellen Stelle
-		UDIV		R5,R0,R4
-		MUL			R5,R5,R4
-		SUB			R5,R0,R5				; R5 : Neuer Wert der Stelle
-		UDIV		R0,R0,R4				; R0 Zeitspanne zur Berechnung der naechsten Stelle
-		UDIV		R6,R1,R4
-		MUL			R6,R6,R4
-		SUB			R6,R1,R6				; R6 : TFTUhr Wert der Stelle
-		UDIV		R1,R1,R4				; R1 Zeitspanne zur Berechnung der naechsten Stelle
-		CMP			R5,R6					; Test, ob der Wert der Stelle sich geaendert hat
-		BEQ			ifStelleVeraendertEnd
-		; Der Wert der Stelle hat sich geaendert
-		LDRB		R8,[R3]					; Position in TFTUhr, die aktualisiert werden muss
-		ADD			R5,#"0"					; ASCII Wert der Stelle
-		STRB		R5,[R7,R8]				; Update TFTUhr
-ifStelleVeraendertEnd		
-		ADD			R2,#1
-		ADD			R3,#2
-		BAL			forUpdateLoop
-forUpdateEnd		
-		; print FTFUhr auf dem TFT Display
-		MOV			R0,R8
-		BL 			PrintTFTZeit
-endUpdateAndPrintTFTZeit		
-		POP			{R4,R5,R6,R7,R8,PC}		; Restore Register und Ruecksprung
+UpdateStelle PROC
+		; Aktualisiere eine Stelle der Uhrzeit auf dem Display
+		;	IN	R0	zu aktualisierende Stelle (index von StrOffset und ValOnDisplay)
+		PUSH		{R4,LR}
+		MOV         R4, R0                  ; Stelle, die ausgegeben wird
+        ; Positioniere Cursor
+	    LDR         R0, =StrOffset
+		LDRB        R0, [R0,R4]
+		ADD         R0, #TFT_TIME_X_POS
+		MOV			R1,	#TFT_TIME_Y_POS
+		BL			lcdGotoXY
+	    ; Geben Zeichen aus
+	    LDR         R0, =ValOnDisplay
+		LDRB        R0, [R0,R4]
+		ADD			R0, #'0'
+		BL			lcdPrintC
+		POP			{R4,PC}	
 		ENDP
 
-;--------------------------------------------
-; Behandlung der Uhrzeit
-;--------------------------------------------
-; Vorgehensweise	Ein 32 Bit Wert speicher die vergangene Zeit seit dem
-;                   Start der Uhrzeit in der Genauigkeit 10 µs
-;					Die Zeitspanne wird in jedem Durchlauf erhˆht. Ist der 
-;					Automat in INIT Zustand, wird sie immer wieder auf 0 gestellt.
-					
-; Update der Zeitspanne auf Basis des Timers
-;--------------------------------------------
-UpdateUhr		PROC	; verwende nur R0 bis R3 und keine weiteren PROC Aufrufe, sichern der Register entfaellt
-		;	IN	R0		Aktuelle Zeitspanne
-		;	OUT	R0		Aktualisierte Zeitspanne
-		LDR		R1,=TIMER					; R1 = neuer Zeitstempel
-		LDR 	R1,[R1]
-		LDR		R2,=TimeStamp				; R2 = Adresse alter Zeitstempel
-		LDR		R3,[R2]						; R3 = alter Zeitstempel
-		STR		R1,[R2]						; Update TimeStamp
-		SUB		R1,R3						; R1 = neuer Zeitstempel - alter Zeitstempel
-		ADD		R0,R1						; R0 = aktualisierte Zeitspanne
-		BX		LR
-		ENDP
-			
-;--------------------------------------------
-; Behandlung der Taster
-;--------------------------------------------
-; Vorgehensweise	Das untere Byte von GPIOE wird ausgelesen
-;					und mit Bitoperationen von den Tastermasken verglichen
-
-; Lese Tasterbelegung aus
-;--------------------------------------------
-LeseTaster		PROC	; verwende nur R0 bis R3 und keine weiteren PROC Aufrufe, sichern der Register entfaellt
-		;	OUT	R0		Aktuelle Zustand der Taster
-		;				0 <=> Taster gedrueckt 
-		LDR		R1,=GPIO_F_PIN				; Lese Tasterstatus ein
-		LDRB	R0,[R1]
-		AND		R0, R0,#TASTER_MASK			; Blende nicht relevante Bits aus
-		BX		LR
+ModuloOp PROC
+        ; Unsigned Modulo Operation R0 = R0 % R1
+		;	IN	R0, R1
+		;   OUT R0
+		UDIV		R2, R0, R1
+		MUL         R2, R1, R2
+        SUB         R0, R2
+		BX		    LR
 		ENDP
 
-; Test, ob genau ein Taster gedrueckt ist
-;--------------------------------------------
-TesteTaster		PROC	; verwende nur R0 bis R3 und keine weiteren PROC Aufrufe, sichern der Register entfaellt
-		;	IN	R0		Aktuelle Zustand der Taster
-		;	IN	R1		Taster, der getestet werden soll
-		;	Ausgabe		(Z Flag == 0) <=> Nur Taster R1 ist gedrueckt
-		EOR		R1,R0
-		CMP		R1,#TASTER_MASK
-		BX		LR
+UpdateAndPrintTFTZeit PROC
+        ; Diese Funktion aktualisiert ValOnDisplay gemäß in RO übergebenen
+		; Zeitspanne in 10µs. Das Display wird aktualisiert.
+		;	IN	R0		Aktuelle Zeitspanne in 10µs
+		PUSH		{R4,R5,R6,LR}
+		MOV			R1,#1000 
+		UDIV		R4, R0, R1     ; R4 : Aktuelle Zeitspanne auf 1/100 s gerundet
+        MOV			R5, #0	       ; R5 : Laufindex
+WhileUpdateLoop					   ; while Schleife, die alle Stellen aktualisiert
+		CMP			R5,#6				; while R5 < 6
+		BEQ			WhileUpdateLoopEnd
+WhileUpdateLoopBody
+        ; Berechne Ziffer von Position R5
+        ; Ziffer an Position R5 : (R4 % ModVal[R5]) / ModVal[R5 + 1]
+        LDR         R6, =ModVal
+        MOV         R0, R4
+	    LDR         R1, [R6,R5, LSL #2]
+	    BL          ModuloOp
+	    ADD         R6,#4
+	    LDR         R1, [R6,R5, LSL #2]
+	    UDIV        R0, R1
+        ; R0 enthält die neue Ziffer für Position R5
+		LDR         R6, =ValOnDisplay
+		LDRB		R1, [R6,R5]   ; R1 enthält alten Wert der Stelle
+		CMP			R0, R1
+		STRB        R0, [R6,R5]   ; neuen Wert der Stelle gespeichert
+		; aktualisiere Stelle auf dem Display von neuer Wert
+		MOV 		R0, R5
+		BLNE		UpdateStelle
+		ADD			R5, #1					; Erhöhe Laufindex
+		B           WhileUpdateLoop
+WhileUpdateLoopEnd		
+		POP			{R4,R5,R6,PC}		; Restore Register und Ruecksprung
 		ENDP
 
-;--------------------------------------------
-; Implementation der FSM
-;--------------------------------------------
+;****************************************************************************
+; Finite State Machine
+
+; Übergangsmatrix
+;                      TAS5          TAS6         TAS7
+; INIT_STATE	    INIT_STATE    INIT_STATE   RUNNING_STATE
+; HOLD_STATE		INIT_STATE	  HOLD_STATE   RUNNING_STATE
+; RUNNING_STATE		INIT_STATE    HOLD_STATE   RUNNING_STATE
 
 FsmTransition		PROC
+        ; Implementation der FSM Übergangsfunktion
 		;	IN	R0		aktueller Zustand
-		;	IN	R1		Belegung der Taster
-		;	OUT	R0		neuer Zustand	
-		; 	Uebergangsfunktion
-		;	Wenn keine Taste gedrueckt ist, 	keine Zustandsaenderung
-		;	Wenn mehrere Taster gedrueckt sind, keine Zustandsaenderung
-		;	akt. Zustand	Taster gedrueckt	neuer Zustand
-		;		*				Tas5				INIT
-		;		RUNNING			Tas6				HOLD
-		;		INIT			Tas6				INIT
-		;		HOLD			Tas6				HOLD
-		;		*				Tas7				RUNNING
-
-
-		PUSH	{R4,R5,R6,LR}			; Sicherer Register	
-		MOV		R4,R0					; R4 speichert den aktuellen Zustand
-		MOV		R5,R1					; R5 speichert die Belegung der Taster
-
-		; Wenn Tas5 alleine gedrueckt ist, Init Zustand setzen und rausspringen
-		MOV 	R0,R1
-		MOV 	R1,#TAS5
-		BL 		TesteTaster
+		;	IN	R1		Belegung der Taster - maximal ein Taster ist gedrückt
+		;	OUT	R0		neuer Zustand
+ifHoldTaste
+		CMP 	R1, #TAS6 
+		BNE     endHoldTaste
+thenHoldTaste
+		; TAS6 gedrückt 
+		CMP 	R0, #INIT_STATE
+		MOVNE	R0, #HOLD_STATE ; TAS6 gedrückt und nicht im INIT State
+endHoldTaste
+		CMP 	R1, #TAS5   ; TAS5 gedrückt: Wechsel stets in den Zustand INIT
 		MOVEQ	R0, #INIT_STATE
-		BEQ		FsmTransitionEnd
-		; Wenn Tas7 alleine gedrueckt ist, Running Zustand setzen und rausspringen
-		MOV 	R0,R5
-		MOV 	R1,#TAS7
-		BL 		TesteTaster
-		MOVEQ	R0,#RUNNING_STATE
-		BEQ		FsmTransitionEnd
-		; Wenn Tas6 nicht alleine gedrueckt, rausspringen
-		MOV 	R0,R5	
-		MOV 	R1,#TAS6
-		BL 		TesteTaster
-		MOVNE	R0,R4
-		BNE		FsmTransitionEnd
-		; Taster 6 ist alleine gedrueckt
-		; Wenn im Zustand Running, dann in den Zustand Hold wechseln, Sonst im alten Zustand bleiben
-		CMP		R4, #RUNNING_STATE
-		MOVEQ	R0, #HOLD_STATE
-		MOVNE	R0, R4
-FsmTransitionEnd
-		POP		{R4,R5,R6,PC}				; Restore Register und Ruecksprung
+		CMP 	R1, #TAS7   ; TAS7 gedrückt: Wechsel stets in den Zustand RUNNING
+		MOVEQ	R0, #RUNNING_STATE
+		BX		LR
 		ENDP
 
-;--------------------------------------------
-; main subroutine
-;--------------------------------------------
-	EXPORT main [CODE]
-	
-main	PROC
+UpdateLEDs PROC
+		; Setze LEDs gemäß aktuellem Zustand der FSM				
+		;	IN	R0		Aktueller Zustand der FSM
+		PUSH		{R4,LR}		
+		MOV			R4, R0
+		MOV			R0, #(LED_RUNNING + LED_HOLD)
+		CMP			R4, #INIT_STATE           ; INIT STATE
+		BLEQ		LEDsoff
+		CMP			R4, #HOLD_STATE           ; HOLD STATE
+		BLEQ		LEDson
+		CMP			R4, #RUNNING_STATE        ; RUNNING STATE
+		MOV			R0,#LED_RUNNING
+		BLEQ		LEDson
+		MOV			R0,#LED_HOLD
+		BLEQ		LEDsoff
+		POP			{R4,PC}	
+		ENDP
+
+main PROC
 		; Initialisierung der HW
 		BL		initITSboard
-		ldr   	r1, =DEFAULT_BRIGHTNESS
-		ldrh 	r0, [r1]
+		ldr   	R0, =DEFAULT_BRIGHTNESS
 		bl   	GUI_init
 		bl  	initTimer
 		ldr 	R1,=TIM2_PSC   			; Set pre scaler such that 1 timer tick represents 10 us
@@ -370,79 +327,38 @@ main	PROC
 		ldr 	R1,=TIM2_ERG   			; Restart timer	
 		mov		R0,#0x01
 		strh	R0,[R1]					; Set UG Bit
-		MOV 	R0, #24
-		bl  	lcdSetFont
-		bl 		InitTFT
-		; BL 		testPSC
-		
-	    ; Start program
-		BL		UpdateUhr					; Damit TimeStamp einen sinnvollen Wert hat
-		MOV		R6,		#0					; R6 = Zeitspanne, der der Wert von TFTUhr entspricht
-		MOV		R7,		#0					; R7 = neue gestoppte Zeitspanne
-		MOV 	R8,		#INIT_STATE			; R8 = aktueller Zustand
-		MOV		R9,		#TASTER_MASK		; R9 = Tasterbelegung
 
-		; superLoop gemaess DDC
-superloop
-		; Aktualisierung der gestoppten Zeitspanne
-		MOV 	R0,R7
+		; Initialisierung der Uhr
+		MOV 	R0, #24
+		BL  	lcdSetFont
+		BL 		InitTFT
+		BL		UpdateUhr					; Damit TimeStamp einen sinnvollen Wert hat
+		MOV 	R4, #0                      ; R4 : aktuelle gestoppte Zeitspanne in 10 µs Auflösung
+		MOV 	R5, #INIT_STATE             ; R5 : aktueller Zustand	
+superloop 
+		; Aktualisierung der akutellen Zeitspanne Zeitspanne
 		BL 		UpdateUhr
-		MOV		R7, R0
-		
+		ADD		R4, R0
 		; lese Eingabe ein
 		BL		LeseTaster
-		MOV		R9, R0
-		
+		MOV		R1, R0
 		; Update Zustand
-		MOV		R0,	R8
-		MOV		R1,	R9
+		MOV		R0,	R5
 		BL	FsmTransition
-		MOV 	R8, R0
-		
+		MOV 	R5, R0
 		; INIT State => setze gestoppte Zeitspanne auf 0
-		CMP		R8,#INIT_STATE
-		MOVEQ	R7,#0
-
+		CMP		R5,#INIT_STATE
+		MOVEQ	R4,#0
 		; update LEDs
-		MOV 	R0, R8
+		MOV 	R0, R5
 		BL 		UpdateLEDs
-		
 		; Wenn  im Zustand HOLD: aktualisierte TFT Uhrzeit nicht
-		CMP		R8,#HOLD_STATE
+		CMP		R5,#HOLD_STATE
 		BEQ		superloop
-		
 		; Update and print TFTUhr, wenn sie sich geaendert hat
-		MOV 	R0, R7
-		MOV		R1, R6
+		MOV 	R0, R4
 		BL UpdateAndPrintTFTZeit
-		MOV		R6,R7		
-		
 		BAL		superloop				; End of superloop
 		ENDP
-
-testPSC		PROC	; Diese Funktion toggelt D8 (PD0) mit einen
-	                ; zeitlichen Abstand von 1000 Ticks
-		MOV	R3, #0  ; Toogle Bit
-loop
-		LDR	R0,=TIMER
-		LDR R1,[R0]
-intloop
-		LDR R2,[R0]
-		SUB	R4, R2,R1
-		CMP R4, #1000
-		BMI	intloop
-		; Toogle LED
-		LDR		R5,=GPIO_D_CLR
-		LDR		R6,=GPIO_D_SET
-		CMP R3,#0
-		MOVNE	R5, R6
-		MOV		R6, #0x1
-		STRH	R6,[R5]
-		EOR		R3, R3, #0xFFFFFFFF
-		B loop
-		BX		LR
-		ENDP
-
-
-		ALIGN
-		END
+	END ; text area
+; EOF
